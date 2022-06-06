@@ -19,7 +19,7 @@ CLUSTER=VMSDRIVER,,,-
         !   resolve references in the driver module to DRIVER$INI_xxx routines
         !   (which are defined in the module DRIVER_TABLE_INIT).
         !
-        SYS$LIBRARY:VMS$VOLATILE_PRIVATE_INTERFACES/INCLUDE=(BUGCHECK_CODES)/LIB,-
+        SYS$LIBRARY:VMS$VOLATILE_PRIVATE_INTERFACES/LIB,-
         !
         !   Explicitly include routines for the initialization section - there
         !   will be no outstanding references to cause this to happen when STARLET
