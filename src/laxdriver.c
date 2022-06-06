@@ -1,6 +1,6 @@
-#pragma module LAVDRIVER "X-1"
+#pragma module LAXDRIVER "X-1"
 /*
- * Load average driver (LAV0:), rewritten in C, returning IEEE floats.
+ * System load average extended driver (LAX0:), returning IEEE floats.
  * Copyright 2022, Jake Hamby.
  * MIT License.
  *
@@ -9,6 +9,8 @@
  */
 
 /* Define system data structure types and constants */
+
+#define __NEW_STARLET 1
 
 #include <bufiodef.h>		/* Define the packet header for a system */
 				/*   buffer for buffered I/O data */
@@ -29,9 +31,8 @@
 #include <pcbdef.h>             /* Process control block */
 #include <ssdef.h>              /* System service status codes */
 #include <stsdef.h>             /* Status value fields */
-#include <tqedef.h>		/* Timer queue element defintion */
 #include <ucbdef.h>             /* Unit control block */
-#include <vecdef.h>             /* IDB interrupt transfer vector */
+#include <aaa_system_cells.h>	/* Global data references */
 
 /* Define function prototypes for system routines */
 
@@ -50,13 +51,13 @@
 #include <string.h>             /* String routines provided by "kernel CRTL" */
 #include <inttypes.h>		/* C99 typedefs (old header for compat.) */
 
-/* Define Device-Dependent Unit Control Block with extensions for LAV device */
+/* Define Device-Dependent Unit Control Block with extensions for LAX device */
 
 typedef struct {
     UCB		ucb$r_ucb;                   /* Generic UCB */
     float	ucb$f_avgs[9];
     uint32_t	ucb$l_priority_mask;
-} LAV_UCB;
+} LAX_UCB;
 
 
 /* Driver table initialization routine */
@@ -65,38 +66,38 @@ typedef struct {
 
 /* Device I/O database structure initialization routine */
 
-    void lav_struc_init (CRB *crb, DDB *ddb, IDB *idb, ORB *orb, LAV_UCB *ucb);
+    void lax_struc_init (CRB *crb, DDB *ddb, IDB *idb, ORB *orb, LAX_UCB *ucb);
 
 /* Device I/O database structure re-initialization routine */
 
-    void lav_struc_reinit (CRB *crb, DDB *ddb, IDB *idb, ORB *orb, LAV_UCB *ucb);
+    void lax_struc_reinit (CRB *crb, DDB *ddb, IDB *idb, ORB *orb, LAX_UCB *ucb);
 
 /* Unit initialization routine */
 
-    int  lav_unit_init (IDB *idb, LAV_UCB *ucb);
+    int  lax_unit_init (IDB *idb, LAX_UCB *ucb);
 
 /* FDT routine for read functions */
 
-    int  lav_read (IRP *irp, PCB *pcb, LAV_UCB *ucb, CCB *ccb);
+    int  lax_read (IRP *irp, PCB *pcb, LAX_UCB *ucb, CCB *ccb);
 
 /* FDT routine for write functions */
 
-    int  lav_write (IRP *irp, PCB *pcb, LAV_UCB *ucb, CCB *ccb);
+//    int  lax_write (IRP *irp, PCB *pcb, LAX_UCB *ucb, CCB *ccb);
 
 /* Periodic load averages update via Fork-wait mechanism */
 
-    void lav_update_stats_fork (void *fr3, void *fr4, LAV_UCB *ucb);
+    void lax_update_stats_fork (void *fr3, void *fr4, LAX_UCB *ucb);
 
 /* Define some constants for the load averaging multiplication factors. */
 
-static const float old_lav_1min = 0.983471453;
-static const float new_lav_1min = 0.016528547;
+static const float old_lax_1min = 0.983471453;
+static const float new_lax_1min = 0.016528547;
 
-static const float old_lav_5min = 0.996672213;
-static const float new_lav_5min = 0.003327787;
+static const float old_lax_5min = 0.996672213;
+static const float new_lax_5min = 0.003327787;
 
-static const float old_lav_15min = 0.998889506;
-static const float new_lav_15min = 0.001110494;
+static const float old_lax_15min = 0.998889506;
+static const float new_lax_15min = 0.001110494;
 
 
 /*
@@ -115,6 +116,8 @@ static const float new_lav_15min = 0.001110494;
  *   routine is called.  Thus the actions of this routine must be confined to
  *   the initialization of the DPT, DDT, and FDT structures which are contained
  *   in the driver image.
+ *
+ *   TODO: switch to VAX MACRO-based table initialization to reduce code size.
  *
  * Calling convention:
  *
@@ -158,18 +161,18 @@ int driver$init_tables (void)  {
 
     /* Finish initialization of the Driver Prologue Table (DPT) */
 
-    ini_dpt_name        (&driver$dpt, "LAVDRIVER");
+    ini_dpt_name        (&driver$dpt, "LAXDRIVER");
     ini_dpt_adapt       (&driver$dpt, AT$_NULL); /* software adapter */
     ini_dpt_defunits    (&driver$dpt, 1);
     ini_dpt_maxunits    (&driver$dpt, 1);
-    ini_dpt_ucbsize     (&driver$dpt, sizeof(LAV_UCB));
-    ini_dpt_struc_init  (&driver$dpt, lav_struc_init );
-    ini_dpt_struc_reinit(&driver$dpt, lav_struc_reinit );
+    ini_dpt_ucbsize     (&driver$dpt, sizeof(LAX_UCB));
+    ini_dpt_struc_init  (&driver$dpt, lax_struc_init );
+    ini_dpt_struc_reinit(&driver$dpt, lax_struc_reinit );
     ini_dpt_end         (&driver$dpt);
 
     /* Finish initialization of the Driver Dispatch Table (DDT) */
 
-    ini_ddt_unitinit    (&driver$ddt, lav_unit_init);
+    ini_ddt_unitinit    (&driver$ddt, lax_unit_init);
     ini_ddt_cancel      (&driver$ddt, ioc_std$cancelio);
     ini_ddt_end         (&driver$ddt);
 
@@ -180,12 +183,15 @@ int driver$init_tables (void)  {
     /* This driver, therefore, supports 64-bit user buffers in all  */
     /* of its I/O functions.					    */
 
-    ini_fdt_act (&driver$fdt, IO$_READLBLK, lav_read, BUFFERED_64);
-    ini_fdt_act (&driver$fdt, IO$_READPBLK, lav_read, BUFFERED_64);
-    ini_fdt_act (&driver$fdt, IO$_READVBLK, lav_read, BUFFERED_64);
-    ini_fdt_act (&driver$fdt, IO$_WRITELBLK, lav_write, BUFFERED_64);
-    ini_fdt_act (&driver$fdt, IO$_WRITEPBLK, lav_write, BUFFERED_64);
-    ini_fdt_act (&driver$fdt, IO$_WRITEVBLK, lav_write, BUFFERED_64);
+    ini_fdt_act (&driver$fdt, IO$_READLBLK, lax_read, BUFFERED_64);
+    ini_fdt_act (&driver$fdt, IO$_READPBLK, lax_read, BUFFERED_64);
+    ini_fdt_act (&driver$fdt, IO$_READVBLK, lax_read, BUFFERED_64);
+
+// Note: writing the priority mask isn't supported.
+//    ini_fdt_act (&driver$fdt, IO$_WRITELBLK, lax_write, BUFFERED_64);
+//    ini_fdt_act (&driver$fdt, IO$_WRITEPBLK, lax_write, BUFFERED_64);
+//    ini_fdt_act (&driver$fdt, IO$_WRITEVBLK, lax_write, BUFFERED_64);
+
     ini_fdt_end (&driver$fdt);
 
     /* If we got this far then everything worked, so return success. */
@@ -222,7 +228,7 @@ int driver$init_tables (void)  {
  *
  * Calling convention:
  *
- *   lav_struc_init (crb, ddb, idb, orb, ucb)
+ *   lax_struc_init (crb, ddb, idb, orb, ucb)
  *
  * Input parameters:
  *
@@ -247,7 +253,7 @@ int driver$init_tables (void)  {
  *
  */ 
 
-void lav_struc_init (CRB *crb, DDB *ddb, IDB *idb, ORB *orb, LAV_UCB *ucb) {
+void lax_struc_init (CRB *crb, DDB *ddb, IDB *idb, ORB *orb, LAX_UCB *ucb) {
 
     /* Initialize the fork lock and device IPL fields */
 
@@ -287,7 +293,7 @@ void lav_struc_init (CRB *crb, DDB *ddb, IDB *idb, ORB *orb, LAV_UCB *ucb) {
  *
  * Calling convention:
  *
- *   lav_struc_reinit (crb, ddb, idb, orb, ucb)
+ *   lax_struc_reinit (crb, ddb, idb, orb, ucb)
  *
  * Input parameters:
  *
@@ -312,7 +318,7 @@ void lav_struc_init (CRB *crb, DDB *ddb, IDB *idb, ORB *orb, LAV_UCB *ucb) {
  *
  */ 
 
-void lav_struc_reinit (CRB *crb, DDB *ddb, IDB *idb, ORB *orb, LAV_UCB *ucb) {
+void lax_struc_reinit (CRB *crb, DDB *ddb, IDB *idb, ORB *orb, LAX_UCB *ucb) {
     
     extern DDT driver$ddt;
 
@@ -325,12 +331,12 @@ void lav_struc_reinit (CRB *crb, DDB *ddb, IDB *idb, ORB *orb, LAV_UCB *ucb) {
      * portion of the CRB in the I/O database to point to the interrupt
      * service routine that's within this driver image.
      */
-    /* dpt_store_isr (crb, lav_interrupt); */
+    /* dpt_store_isr (crb, lax_interrupt); */
 }
 
 
 /*
- * LAV_UNIT_INIT - Unit Initialization Routine
+ * LAX_UNIT_INIT - Unit Initialization Routine
  *
  * Functional description:
  *
@@ -345,7 +351,7 @@ void lav_struc_reinit (CRB *crb, DDB *ddb, IDB *idb, ORB *orb, LAV_UCB *ucb) {
  *
  * Calling convention:
  *
- *   status = lav_unit_init (idb, ucb)
+ *   status = lax_unit_init (idb, ucb)
  *
  * Input parameters:
  *
@@ -367,7 +373,7 @@ void lav_struc_reinit (CRB *crb, DDB *ddb, IDB *idb, ORB *orb, LAV_UCB *ucb) {
  *   Kernel mode, system context, IPL 31.
  */
  
-int lav_unit_init (IDB *idb, LAV_UCB *ucb)  {
+int lax_unit_init (IDB *idb, LAX_UCB *ucb)  {
 
 #if defined DEBUG
     /* If a debug version of this driver is being built then invoke the loaded
@@ -399,7 +405,7 @@ int lav_unit_init (IDB *idb, LAV_UCB *ucb)  {
 
     /* Set up the first call to update load averages via fork-wait. */
 
-    fork_wait (lav_update_stats_fork, NULL, NULL, ucb);
+    fork_wait (lax_update_stats_fork, NULL, NULL, ucb);
 
     /* Mark the device as online and ready to accept I/O requests */
 
@@ -410,7 +416,7 @@ int lav_unit_init (IDB *idb, LAV_UCB *ucb)  {
 
 
 /*
- * LAV_READ - FDT Routine for Read Function Codes 
+ * LAX_READ - FDT Routine for Read Function Codes 
  *
  * Functional description:
  *
@@ -424,7 +430,7 @@ int lav_unit_init (IDB *idb, LAV_UCB *ucb)  {
  *
  * Calling convention:
  *
- *   status = lav_read (irp, pcb, ucb, ccb)
+ *   status = lax_read (irp, pcb, ucb, ccb)
  *
  * Input parameters:
  *
@@ -446,7 +452,7 @@ int lav_unit_init (IDB *idb, LAV_UCB *ucb)  {
  *   Kernel mode, user process context, IPL 2.
  */
 
-int lav_read (IRP *irp, PCB *pcb, LAV_UCB *ucb, CCB *ccb) {
+int lax_read (IRP *irp, PCB *pcb, LAX_UCB *ucb, CCB *ccb) {
 
     CHAR_PQ qio_bufp;           /* 64-bit pointer to caller's buffer */
     int qio_buflen;             /* Number of bytes in caller's buffer */
@@ -459,7 +465,7 @@ int lav_read (IRP *irp, PCB *pcb, LAV_UCB *ucb, CCB *ccb) {
     qio_bufp   = (CHAR_PQ)irp->irp$q_qio_p1;
 
     /* Return an SS$_BADPARAM error if the read size is too small. */
-    if (irp->irp$l_qio_p2 < 4) {
+    if (irp->irp$l_qio_p2 < sizeof(float)) {
 	return ( call_abortio (irp, pcb, (UCB *)ucb, SS$_BADPARAM) );
     }
 
@@ -487,9 +493,14 @@ int lav_read (IRP *irp, PCB *pcb, LAV_UCB *ucb, CCB *ccb) {
 }
 
 /*
- * LAV_WRITE - FDT Routine for Write Function Codes 
+ * LAX_WRITE - FDT Routine for Write Function Codes 
  *
  * Functional description:
+ *
+ *   This is currently commented out because I don't want to reimplement
+ *   the original LAVDRIVER behavior that lets you mask out processes at
+ *   specific priorities from being counted. I bet nobody has ever used
+ *   that feature. Later versions of this driver could add functions here.
  *
  *   Since this is an upper-level FDT routine, this routine always returns
  *   the SS$_FDT_COMPL status.  The $QIO status that is to be returned to
@@ -499,7 +510,7 @@ int lav_read (IRP *irp, PCB *pcb, LAV_UCB *ucb, CCB *ccb) {
  *
  * Calling convention:
  *
- *   status = lav_write (irp, pcb, ucb, ccb)
+ *   status = lax_write (irp, pcb, ucb, ccb)
  *
  * Input parameters:
  *
@@ -521,10 +532,15 @@ int lav_read (IRP *irp, PCB *pcb, LAV_UCB *ucb, CCB *ccb) {
  *   Kernel mode, user process context, IPL 2.
  */
 
-int lav_write (IRP *irp, PCB *pcb, LAV_UCB *ucb, CCB *ccb) {
+#if 0
+int lax_write (IRP *irp, PCB *pcb, LAX_UCB *ucb, CCB *ccb) {
 
     CHAR_PQ qio_bufp;           /* 64-bit pointer to caller's buffer */
     int qio_buflen;             /* Number of bytes in caller's buffer */
+
+    /* Check if the caller has the required CMKRNL privilege. */
+    if ((pcb->pcb$q_priv & PRV$M_CMKRNL) == 0)
+        return ( call_abortio (irp, pcb, (UCB *)ucb, SS$_NOPRIV) );
 
     /* Get the pointer to the caller's buffer and the size of the caller's
      * buffer from the $QIO P1 and P2 parameters respectively.  The caller's
@@ -534,13 +550,13 @@ int lav_write (IRP *irp, PCB *pcb, LAV_UCB *ucb, CCB *ccb) {
     qio_bufp   = (CHAR_PQ)irp->irp$q_qio_p1;
 
     /* Return an SS$_BADPARAM error if the write size is too small. */
-    if (irp->irp$l_qio_p2 < 4) {
+    if (irp->irp$l_qio_p2 < sizeof(uint32_t)) {
 	return ( call_abortio (irp, pcb, (UCB *)ucb, SS$_BADPARAM) );
     }
 
     /* Truncate the write size to 4 bytes if needed. */
-    if (irp->irp$l_qio_p2 > 4) {
-	irp->irp$l_qio_p2 = 4;
+    if (irp->irp$l_qio_p2 > sizeof(uint32_t)) {
+	irp->irp$l_qio_p2 = sizeof(uint32_t);
     }
 
     qio_buflen = irp->irp$l_qio_p2;
@@ -555,24 +571,28 @@ int lav_write (IRP *irp, PCB *pcb, LAV_UCB *ucb, CCB *ccb) {
                                    qio_bufp, qio_buflen);
         if ( ! $VMS_STATUS_SUCCESS(status) ) return status;
 
-	memcpy( &(ucb->ucb$l_priority_mask), qio_bufp, qio_buflen );
+	/* Invert the priority mask for easier use later. */
+	ucb->ucb$l_priority_mask = ~(*((__unaligned uint32_t*) qio_bufp));
     }
 
     return ( call_finishio (irp, (UCB *)ucb, SS$_NORMAL, 0) );
 }
+#endif
 
 
 /*
- * LAV_UPDATE_STATS_FORK - Periodic update of load averages
+ * LAX_UPDATE_STATS_FORK - Periodic update of load averages
  *
  * Functional description:
  *
  *   This routine performs a once-a-second update of the load average data.
- *   The algorithm is the same as the original LAVDRIVER.
+ *   The algorithm is the same as the original LAXDRIVER, except that the
+ *   system load average isn't divided by the number of active CPUs, and
+ *   the values are all returned as IEEE floats, not VAX F_floating type.
  *
  * Calling convention:
  *
- *   lav_update_stats_fork (irp, not_used, ucb)
+ *   lax_update_stats_fork (irp, not_used, ucb)
  *
  * Input parameters:
  *
@@ -593,20 +613,21 @@ int lav_write (IRP *irp, PCB *pcb, LAV_UCB *ucb, CCB *ccb) {
  *   Kernel mode, system context, fork IPL, fork lock held.
  */
 
-void lav_update_stats_fork (void *fr3, void *fr4, LAV_UCB *ucb) {
+void lax_update_stats_fork (void *fr3, void *fr4, LAX_UCB *ucb) {
     int orig_ipl;
     int status;
 
     int busy_processes = 0;
     int io_queue_len = 0;
 
-    /* First, acquire the SCHED spinlock, so we can count busy processes. */
-    sys_lock (SCHED, RAISE_IPL, &orig_ipl);
+    /* Use $GETRMI to get the process counts asynchronously. */
+    // RMI$_COLPG = # of procs in collided page wait state
+    // RMI$_COM = # of procs in computable state
+    // RMI$_COMO = # of proc in computable outswapped state
+    // RMI$_CUR = # of proc currently executing
+    // RMI$_FPG = # of proc in free page wait state
+    // RMI$_PFW = # of proc in page fault wait state
 
-    /* TODO: fill in stats here */
-
-    /* Now, release the SCHED spinlock and get the disk queue lengths. */
-    sys_unlock (SCHED, orig_ipl, SMP_RESTORE);
 
     /* TODO: fill in stats here */
 
@@ -619,5 +640,5 @@ void lav_update_stats_fork (void *fr3, void *fr4, LAV_UCB *ucb) {
     device_unlock (ucb->ucb$r_ucb.ucb$l_dlck, orig_ipl, SMP_RESTORE);
 
     /* Setup to check the device again in one second via the fork-wait queue */
-    fork_wait (lav_update_stats_fork, NULL, NULL, ucb);
+    fork_wait (lax_update_stats_fork, NULL, NULL, ucb);
 }
