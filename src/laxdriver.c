@@ -25,6 +25,7 @@
 #include <ddtdef.h>             /* Driver dispatch table */
 #include <devdef.h>             /* Device characteristics */
 #include <dptdef.h>             /* Driver prologue table */
+#include <dyndef.h>             /* Data structure type definitions */
 #include <fdtdef.h>             /* Function decision table */
 #include <idbdef.h>             /* Interrupt data block */
 #include <iocdef.h>             /* IOC constants */
@@ -35,6 +36,7 @@
 #include <prvdef.h>             /* Privilege bits */
 #include <ssdef.h>              /* System service status codes */
 #include <stsdef.h>             /* Status value fields */
+#include <tqedef.h>             /* Timer queue entry fields */
 #include <ucbdef.h>             /* Unit control block */
 #include <aaa_system_cells.h>	/* Global data references */
 
@@ -58,8 +60,9 @@
 
 /* Define the fixed-point scaling factors. Update the constants if you change them. */
 
-#define FX_SCALE	14		/* scaling factor for saved results */
-#define FX_SHIFT (FX_SCALE + 10)	/* extra coefficient scaling for accuracy */
+#define FX_SCALE	14		/* scaling factor for stored results */
+#define FX_LSHIFT   (FX_SCALE - 8)	/* coefficients will shift 8 extra bits */
+#define FX_RSHIFT   (FX_SCALE + 10)	/* right-shift after multiply and add */
 
 /* Define Device-Dependent Unit Control Block with extensions for LAX device */
 
@@ -68,30 +71,35 @@ typedef struct {
     uint32_t	ucb$fx_avgs[9];		/* fixed-point data to return on reads */
     bool	ucb$b_is_stopping;	/* user request to stop pending */
     bool	ucb$b_is_stopped;	/* stats update is currently stopped */
+    TQE		ucb$l_tqe;		/* timer tick (1 Hz) */
 } LAX_UCB;
 
 /* Define const references to the global data we need to reference */
 
+/* System time */
+extern uint64_t	exe$gq_systime;
+
 /* Bit vectors of which priority queues are active (bit 0 = priority 63) */
-extern const uint64_t	sch$gq_comqs;	    /* computable queue */
-extern const uint64_t	sch$gq_comoqs;	    /* computable (outswapped) queue */
+extern uint64_t	sch$gq_comqs;	/* computable queue */
+extern uint64_t	sch$gq_comoqs;	/* computable (outswapped) queue */
 
 /* Array of queue heads and tails for each priority, from 63 to 0 */
-extern KTB* const	sch$aq_comh[];	    /* COM queue heads and tails */
-extern KTB* const	sch$aq_comoh[];	    /* COMO queue heads and tails */
+extern KTB* sch$aq_comh[];	/* COM queue heads and tails */
+extern KTB* sch$aq_comoh[];	/* COMO queue heads and tails */
 
 /* Queue heads for the three wait states we care about */
-extern KTB* const	sch$gq_colpgwq;	    /* collided page wait queue */
-extern KTB* const	sch$gq_pfwq;	    /* page fault wait queue */
-extern KTB* const	sch$gq_fpgwq;	    /* free page wait queue */
+extern KTB* sch$gq_colpgwq;	/* collided page wait queue */
+extern KTB* sch$gq_pfwq;	/* page fault wait queue */
+extern KTB* sch$gq_fpgwq;	/* free page wait queue */
 
-/* TODO: handle CPU IDs above 63 */
+/* TODO: Use CBB functions instead of bitmasks to support > 64 CPUs */
 
-extern const uint32_t	smp$gl_max_cpuid;   /* max CPU ID for bitmasks */
-extern const uint64_t	smp$gq_active_set;  /* active CPU set bitmask */
-extern const uint64_t	sch$gq_idle_cpus;   /* idle CPU set bitmask */
+extern uint32_t	smp$gl_max_cpuid;   /* max CPU ID for bitmasks */
+extern uint64_t	smp$gq_active_set;  /* active CPU set bitmask */
 
-extern const CPU*	smp$gl_cpu_data[];  /* CPU data pointer array */
+extern CPU* smp$gl_cpu_data[];  /* CPU data pointer array */
+
+extern MUTEX ioc$gq_mutex;	/* mutex for IOC database */
 
 /* Driver table initialization routine */
 
@@ -117,13 +125,9 @@ static int  lax_read (IRP *irp, PCB *pcb, LAX_UCB *ucb, CCB *ccb);
 
 static int  lax_write (IRP *irp, PCB *pcb, LAX_UCB *ucb, CCB *ccb);
 
-/* Periodic load averages update via Fork-wait mechanism */
+/* Periodic load averages update via timer queue entry */
 
-static void lax_update_stats_fork (void *fr3, void *fr4, LAX_UCB *ucb);
-
-/* Completion AST callback for load averages update after fork-wait */
-
-static void lax_finish_fork_update (LAX_UCB *ucb);
+static void lax_stats_update_int (void *fr3, LAX_UCB *ucb, TQE *tqe);
 
 /*
  * DRIVER$INIT_TABLES - Initialize Driver Tables
@@ -296,6 +300,15 @@ static void lax_struc_init (CRB *crb, DDB *ddb, IDB *idb, ORB *orb, LAX_UCB *ucb
     ucb->ucb$r_ucb.ucb$b_devclass = DC$_MISC;
     /* ucb->ucb$r_ucb.ucb$b_devtype = LP$_LP11; */  /* we have no device type */
     ucb->ucb$r_ucb.ucb$w_devbufsiz = sizeof(ucb->ucb$fx_avgs);   /* 36 byte buffer */
+
+    /* set up our 1 Hz TQE */
+    ucb->ucb$l_tqe.tqe$w_size = TQE$C_LENGTH;
+    ucb->ucb$l_tqe.tqe$b_type = DYN$C_TQE;
+    ucb->ucb$l_tqe.tqe$b_rqtype = TQE$C_SSREPT;
+    ucb->ucb$l_tqe.tqe$q_fr3 = 0;
+    ucb->ucb$l_tqe.tqe$q_fr4 = (__int64) ucb;
+    ucb->ucb$l_tqe.tqe$l_fpc = (int) lax_stats_update_int;
+    ucb->ucb$l_tqe.tqe$q_delta = 10000000;  /* VMS time uses 100 ns units */
 }
 
 
@@ -428,8 +441,11 @@ static int lax_unit_init (IDB *idb, LAX_UCB *ucb)  {
      */
     idb->idb$ps_owner = &(ucb->ucb$r_ucb); 
 
-    /* Set up the first call to update load averages via fork-wait. */
-    fork_wait (lax_update_stats_fork, NULL, NULL, ucb);
+    /* Start the timer */
+    uint64_t tick_time = exe$gq_systime + ucb->ucb$l_tqe.tqe$q_delta;
+    exe_std$instimq((int) (tick_time & 0xffffffff),
+		    (int) ((tick_time >> 32) & 0xffffffff),
+		    (TQE *) &ucb->ucb$l_tqe);
 
     /* Mark the device as online and ready to accept I/O requests */
     ucb->ucb$r_ucb.ucb$v_online = 1;
@@ -477,15 +493,12 @@ static int lax_unit_init (IDB *idb, LAX_UCB *ucb)  {
 
 static int lax_read (IRP *irp, PCB *pcb, LAX_UCB *ucb, CCB *ccb) {
 
-    CHAR_PQ qio_bufp;           /* 64-bit pointer to caller's buffer */
-    int qio_buflen;             /* Number of bytes in caller's buffer */
-
     /* Get the pointer to the caller's buffer and the size of the caller's
      * buffer from the $QIO P1 and P2 parameters respectively.  The caller's
      * buffer is treated as a 64-bit address although it may be a 32-bit 
      * address.
      */
-    qio_bufp   = (CHAR_PQ)irp->irp$q_qio_p1;
+    CHAR_PQ qio_bufp = (CHAR_PQ)irp->irp$q_qio_p1;
 
     /* Return an SS$_BADPARAM error if the read size is too small. */
     if (irp->irp$l_qio_p2 < sizeof(uint32_t)) {
@@ -497,7 +510,7 @@ static int lax_read (IRP *irp, PCB *pcb, LAX_UCB *ucb, CCB *ccb) {
 	irp->irp$l_qio_p2 = sizeof(ucb->ucb$fx_avgs);
     }
 
-    qio_buflen = irp->irp$l_qio_p2;
+    int qio_buflen = irp->irp$l_qio_p2;
 
     /* Assure that the caller has write access to this buffer to do a read
      * operation.  If not, exe_std$readchk will abort the I/O request and
@@ -523,7 +536,7 @@ static int lax_read (IRP *irp, PCB *pcb, LAX_UCB *ucb, CCB *ccb) {
  *   The original LAVDRIVER behavior for writes is to update a mask to
  *   disable specific priorities from being counted. I suspect nobody has
  *   ever used that feature. So this version repurposes writes to set
- *   a single boolean flag to 1 to stop the load average update fork-wait
+ *   a single boolean flag to 1 to stop the load average update timer
  *   callback (e.g. for benchmarking), or to 0 to restart the load average
  *   service. Additional bits/bytes are ignored and should be set to zero.
  *
@@ -559,9 +572,6 @@ static int lax_read (IRP *irp, PCB *pcb, LAX_UCB *ucb, CCB *ccb) {
 
 static int lax_write (IRP *irp, PCB *pcb, LAX_UCB *ucb, CCB *ccb) {
 
-    CHAR_PQ qio_bufp;           /* 64-bit pointer to caller's buffer */
-    int qio_buflen;             /* Number of bytes in caller's buffer */
-
     /* Check if the caller has the required CMKRNL privilege. */
     if ((pcb->pcb$q_priv & PRV$M_CMKRNL) == 0)
         return ( call_abortio (irp, pcb, (UCB *)ucb, SS$_NOPRIV) );
@@ -571,8 +581,8 @@ static int lax_write (IRP *irp, PCB *pcb, LAX_UCB *ucb, CCB *ccb) {
      * buffer is treated as a 64-bit address although it may be a 32-bit 
      * address.
      */
-    qio_bufp   = (CHAR_PQ)irp->irp$q_qio_p1;
-    qio_buflen = irp->irp$l_qio_p2;
+    CHAR_PQ qio_bufp = (CHAR_PQ)irp->irp$q_qio_p1;
+    int qio_buflen = irp->irp$l_qio_p2;
 
     /* Return an SS$_BADPARAM error if the write size is too small. */
     if (qio_buflen < sizeof(bool)) {
@@ -599,8 +609,12 @@ static int lax_write (IRP *irp, PCB *pcb, LAX_UCB *ucb, CCB *ccb) {
 	    /* Note: ucb$b_is_stopping should already be false */
 	    ucb->ucb$b_is_stopped = false;
 
-	    /* Restart the fork-wait callback. */
-	    fork_wait (lax_update_stats_fork, NULL, NULL, ucb);
+	    /* Restart the timer */
+	    ucb->ucb$l_tqe.tqe$b_rqtype = TQE$C_SSREPT;
+	    uint64_t tick_time = exe$gq_systime + ucb->ucb$l_tqe.tqe$q_delta;
+	    exe_std$instimq((int) (tick_time & 0xffffffff),
+			    (int) ((tick_time >> 32) & 0xffffffff),
+			    (TQE *) &ucb->ucb$l_tqe);
  	}
     }
 
@@ -609,40 +623,46 @@ static int lax_write (IRP *irp, PCB *pcb, LAX_UCB *ucb, CCB *ccb) {
 
 /* Define some constants for the load averaging multiplication factors.
  * I used Python to compute the exponential decays for fixed-point math.
+ * The multipliers for the new values have an extra 8 bits of fraction.
+ * This is subtracted from the 14 bits that the integers are shifted,
+ * so that the old and new coefficients will both have 24 fraction bits.
  */
 
-/* 1/exp(1s/60s) * (1<<(FX_SHIFT)) */
+/* old: 1/exp(1s/60s) * (1<<24) */
+/* new: (1 - 1/exp(1s/60s)) * (1<<32) */
 static const uint32_t old_lav_1min = 16499913;
-static const uint32_t new_lav_1min = 277303;
+static const uint32_t new_lav_1min = 70989565;
 
-/* 1/exp(1s/300s) * (1<<(FX_SHIFT)) */
+/* old: 1/exp(1s/300s) * (1<<24) */
+/* new: (1 - 1/exp(1s/300s)) * (1<<32) */
 static const uint32_t old_lav_5min = 16721385;
-static const uint32_t new_lav_5min = 55831;
+static const uint32_t new_lav_5min = 14292723;
 
-/* 1/exp(1s/900s) * (1<<(FX_SHIFT)) */
+/* old: 1/exp(1s/900s) * (1<<24) */
+/* new: (1 - 1/exp(1s/900s)) * (1<<32) */
 static const uint32_t old_lav_15min = 16758585;
-static const uint32_t new_lav_15min = 18631;
+static const uint32_t new_lav_15min = 4769536;
 
 /*
- * LAX_UPDATE_STATS_FORK - Periodic update of load averages
+ * LAX_STATS_UPDATE_INT - Periodic update of load averages
  *
  * Functional description:
  *
  *   This routine performs a once-a-second update of the load average data.
  *   The algorithm is the same as the original LAXDRIVER, except that the
- *   system load average isn't divided by the number of active CPUs, and
+ *   system load average is not divided by the number of active CPUs, and
  *   the values are all returned as 32-bit unsigned integers representing
  *   fixed-point values with a binary scaling factor of 14 bits.
  *
  * Calling convention:
  *
- *   lax_update_stats_fork (irp, not_used, ucb)
+ *   lax_stats_update_int (fr3, ucb, tqe)
  *
  * Input parameters:
  *
- *   not_used	Unused fork routine parameter fr3
- *   not_used   Unused fork routine parameter fr4
+ *   fr3	Unused
  *   ucb        Pointer to unit control block
+ *   tqe        Pointer to TQE used to time request
  *
  * Output parameters:
  *
@@ -654,90 +674,95 @@ static const uint32_t new_lav_15min = 18631;
  *
  * Environment:
  * 
- *   Kernel mode, system context, fork IPL, fork lock held.
+ *   Kernel mode, system context, at timer IPL.
  */
 
-static void lax_update_stats_fork (void *fr3, void *fr4, LAX_UCB *ucb) {
-    int orig_ipl;
-    int status;
-
-    uint32_t proc_count = 0;
-    uint32_t lowest_pri = 256;	/* first active CPU will replace value */
-
+static void lax_stats_update_int (void *fr3, LAX_UCB *ucb, TQE *tqe) {
     /* acquire the SCHED spinlock, so we can count runnable processes. */
+    int orig_ipl;
     sys_lock (SCHED, RAISE_IPL, &orig_ipl);
 
-    /* traverse COM and COMO queues for each priority that's in use.
-     * increment index by 2 to skip over list tail pointers.
-     */
-    uint64_t mask = 0x01;
-    for (int idx = 0; idx < 128; idx += 2, mask <<= 1) {
-	if (sch$gq_comqs & mask) {
-	    for (KTB *ktb = sch$aq_comh[idx]; ktb != NULL;
-		      ktb = ktb->ktb$l_sqfl) {
+    uint32_t proc_count = 0;
+
+    /* Traverse COM and COMO queues for each priority that's in use. */
+
+    uint64_t testmask = 0x01;
+    for (int idx = 0; idx < 128; idx += 2, testmask <<= 1) {
+	if (sch$gq_comqs & testmask) {
+	    KTB* head = sch$aq_comh[idx];
+	    KTB* ktb = head;
+	    while ((ktb = ktb->ktb$l_sqfl) != head) {
 		proc_count++;
 	    }
 	}
 
-	if (sch$gq_comoqs & mask) {
-	    for (KTB *ktb = sch$aq_comoh[idx]; ktb != NULL;
-		      ktb = ktb->ktb$l_sqfl) {
+	if (sch$gq_comoqs & testmask) {
+	    KTB* head = sch$aq_comoh[idx];
+	    KTB* ktb = head;
+	    while ((ktb = ktb->ktb$l_sqfl) != head) {
 		proc_count++;
 	    }
 	}
     }
 
-    /* count kernel threads in collided page wait */
-    for (KTB *ktb = sch$gq_colpgwq; ktb != NULL; ktb = ktb->ktb$l_sqfl) {
+    /* add processes from the three page-fault-related wait queues */
+
+    KTB* ktb = sch$gq_colpgwq;
+    while ((ktb = ktb->ktb$l_sqfl) != sch$gq_colpgwq) {
 	proc_count++;
     }
 
-    /* count kernel threads in page fault wait */
-    for (KTB *ktb = sch$gq_pfwq; ktb != NULL; ktb = ktb->ktb$l_sqfl) {
+    ktb = sch$gq_pfwq;
+    while ((ktb = ktb->ktb$l_sqfl) != sch$gq_pfwq) {
 	proc_count++;
     }
 
-    /* count kernel threads in free page wait */
-    for (KTB *ktb = sch$gq_fpgwq; ktb != NULL; ktb = ktb->ktb$l_sqfl) {
+    ktb = sch$gq_fpgwq;
+    while ((ktb = ktb->ktb$l_sqfl) != sch$gq_fpgwq) {
 	proc_count++;
     }
 
-    /* check active CPUs for processes and their priorities */
-    uint64_t cpu_bitmask = smp$gq_active_set;
+    /* check active CPUs for running processes and their priorities */
+    uint32_t lowest_pri = UINT32_MAX;	/* first active CPU will replace this */
+    testmask = 0x01;
 
-    for (int cpuid = 0; cpuid <= smp$gl_max_cpuid; cpuid++, cpu_bitmask >>= 1) {
-	if (cpu_bitmask & 0x01) {
-	    /* Let's assume this is non-NULL; otherwise, something's wrong */
+    const uint64_t cpu_bitmask = smp$gq_active_set;
+    const int max_cpuid = (smp$gl_max_cpuid > 63 ? 63 : smp$gl_max_cpuid);
+    for (int cpuid = 0; cpuid <= max_cpuid; cpuid++, testmask <<= 1) {
+	if (cpu_bitmask & testmask) {
+	    /* assume this is non-NULL; otherwise, something's very wrong */
 	    const CPU *cpu = smp$gl_cpu_data[cpuid];
 
-	    /* Note: idle CPUs will have the cpu$l_cur_pri set to -1 */
-	    if (cpu->cpu$l_cur_pri != (unsigned int)(-1)) {
+	    /* priority will be -1 if we're not running a kernel thread */
+	    if (cpu->cpu$l_cur_pri != UINT32_MAX) {
 		proc_count++;	/* add active kernel thread to the count */
 
-		if (cpu->cpu$l_cur_pri < lowest_pri) {
-		    lowest_pri = cpu->cpu$l_cur_pri;
+		/* invert internal priority by subtracting from 63 */
+		uint32_t cur_pri = (63 - cpu->cpu$l_cur_pri);
+		if (cur_pri < lowest_pri) {
+		    lowest_pri = cur_pri;
 		}
 	    }
 	}
     }
 
-    /* release the SCHED spinlock */
-    sys_unlock (SCHED, orig_ipl, SMP_RESTORE);
-
-    if (lowest_pri == 256) {
-	lowest_pri = 0;	    /* no CPUs are running kernel threads */
-    }
-
     /* get the sum of all disk queue lengths */
-    uint32_t disk_queue_len = 0;
+    uint32_t disk_queue_len = UINT32_MAX;
     UCB* cur_ucb = NULL;
     DDB* cur_ddb = NULL;
+
+    /* skip disk queue length update if we can't lock the IOC database */
+    if (!$VMS_STATUS_SUCCESS(sch_std$lockrexec_quad(&ioc$gq_mutex))) {
+	goto skip_scan_queue_len;
+    }
+
+    disk_queue_len = 0;	    /* distinguish between 0 and failure to lock mutex */
 
     /* this will return low bit clear when there are no more devices */
     while ($VMS_STATUS_SUCCESS(
 	    ioc_std$scan_iodb(cur_ucb, cur_ddb, &cur_ucb, &cur_ddb))) {
 	/* is this a mounted disk and not a class driver or shadow set member? */
-	if (cur_ucb && (cur_ucb->ucb$b_devclass == DC$_DISK) &&
+	if ((cur_ucb->ucb$b_devclass == DC$_DISK) &&
 		(cur_ucb->ucb$l_devchar & DEV$M_MNT) &&
 		!(cur_ucb->ucb$l_devchar2 & (DEV$M_CDP | DEV$M_SSM)) &&
 		(cur_ucb->ucb$l_qlen > 0)) {
@@ -745,56 +770,71 @@ static void lax_update_stats_fork (void *fr3, void *fr4, LAX_UCB *ucb) {
 	}
     }
 
-    /* scale all three stats to fixed-point with a 14-bit scale */
+    /* lock and unlock mutex need to acquire SCHED, so do both before releasing it */
+    sch_std$unlockexec_quad(&ioc$gq_mutex);
 
-    proc_count <<= FX_SCALE;
-    lowest_pri <<= FX_SCALE;
-    disk_queue_len <<= FX_SCALE;
+skip_scan_queue_len:
 
-    /* Acquire the UCB device lock, raise IPL, saving original IPL */
+    /* release the SCHED spinlock */
+    sys_unlock (SCHED, orig_ipl, SMP_RESTORE);
+
+    /* acquire the UCB device lock, raising IPL, saving previous IPL */
     device_lock (ucb->ucb$r_ucb.ucb$l_dlck, RAISE_IPL, &orig_ipl);
 
-    /* unlock and bail out now if the user asked us to stop updating */
+    /* bail out now if the user asked us to stop updating */
     if (ucb->ucb$b_is_stopping) {
 	ucb->ucb$b_is_stopping = false;
 	ucb->ucb$b_is_stopped = true;
 
 	/* all 0 bits is +0.0 in IEEE-754 */
     	memset(&(ucb->ucb$fx_avgs), 0, sizeof(ucb->ucb$fx_avgs));
-	device_unlock (ucb->ucb$r_ucb.ucb$l_dlck, orig_ipl, SMP_RESTORE);
-	return;
+
+	/* cancel the timer */
+	tqe->tqe$b_rqtype = 0;
+
+	goto unlock;	/* release device lock and return */
     }
 
+    proc_count <<= FX_LSHIFT;
     ucb->ucb$fx_avgs[0] = (uint32_t)(((((uint64_t)ucb->ucb$fx_avgs[0]) * old_lav_1min) +
-				((uint64_t)proc_count * new_lav_1min)) >> FX_SHIFT);
+				((uint64_t)proc_count * new_lav_1min)) >> FX_RSHIFT);
 
     ucb->ucb$fx_avgs[1] = (uint32_t)(((((uint64_t)ucb->ucb$fx_avgs[1]) * old_lav_5min) +
-				((uint64_t)proc_count * new_lav_5min)) >> FX_SHIFT);
+				((uint64_t)proc_count * new_lav_5min)) >> FX_RSHIFT);
 
     ucb->ucb$fx_avgs[2] = (uint32_t)(((((uint64_t)ucb->ucb$fx_avgs[2]) * old_lav_15min) +
-				((uint64_t)proc_count * new_lav_15min)) >> FX_SHIFT);
+				((uint64_t)proc_count * new_lav_15min)) >> FX_RSHIFT);
 
+    if (lowest_pri == UINT32_MAX) {
+	lowest_pri = 0;	    /* no CPUs are running processes */
+    } else {
+	lowest_pri <<= FX_LSHIFT;
+    }
     ucb->ucb$fx_avgs[3] = (uint32_t)(((((uint64_t)ucb->ucb$fx_avgs[3]) * old_lav_1min) +
-				((uint64_t)lowest_pri * new_lav_1min)) >> FX_SHIFT);
+				((uint64_t)lowest_pri * new_lav_1min)) >> FX_RSHIFT);
 
     ucb->ucb$fx_avgs[4] = (uint32_t)(((((uint64_t)ucb->ucb$fx_avgs[4]) * old_lav_5min) +
-				((uint64_t)lowest_pri * new_lav_5min)) >> FX_SHIFT);
+				((uint64_t)lowest_pri * new_lav_5min)) >> FX_RSHIFT);
 
     ucb->ucb$fx_avgs[5] = (uint32_t)(((((uint64_t)ucb->ucb$fx_avgs[5]) * old_lav_15min) +
-				((uint64_t)lowest_pri * new_lav_15min)) >> FX_SHIFT);
+				((uint64_t)lowest_pri * new_lav_15min)) >> FX_RSHIFT);
 
-    ucb->ucb$fx_avgs[6] = (uint32_t)(((((uint64_t)ucb->ucb$fx_avgs[6]) * old_lav_1min) +
-				((uint64_t)disk_queue_len * new_lav_1min)) >> FX_SHIFT);
+    /* skip this section if we failed to lock the IOC database mutex */
+    if (disk_queue_len != UINT32_MAX) {
+	disk_queue_len <<= FX_LSHIFT;
 
-    ucb->ucb$fx_avgs[7] = (uint32_t)(((((uint64_t)ucb->ucb$fx_avgs[7]) * old_lav_5min) +
-				((uint64_t)disk_queue_len * new_lav_5min)) >> FX_SHIFT);
+	ucb->ucb$fx_avgs[6] = (uint32_t)(((((uint64_t)ucb->ucb$fx_avgs[6]) * old_lav_1min) +
+				    ((uint64_t)disk_queue_len * new_lav_1min)) >> FX_RSHIFT);
 
-    ucb->ucb$fx_avgs[8] = (uint32_t)(((((uint64_t)ucb->ucb$fx_avgs[8]) * old_lav_15min) +
-				((uint64_t)disk_queue_len * new_lav_15min)) >> FX_SHIFT);
+	ucb->ucb$fx_avgs[7] = (uint32_t)(((((uint64_t)ucb->ucb$fx_avgs[7]) * old_lav_5min) +
+				    ((uint64_t)disk_queue_len * new_lav_5min)) >> FX_RSHIFT);
 
-    /* Restore the UCB device lock, return to the original entry IPL */
+	ucb->ucb$fx_avgs[8] = (uint32_t)(((((uint64_t)ucb->ucb$fx_avgs[8]) * old_lav_15min) +
+				    ((uint64_t)disk_queue_len * new_lav_15min)) >> FX_RSHIFT);
+    }
+
+unlock:
+
+    /* Release the UCB device lock, returning to the previous IPL */
     device_unlock (ucb->ucb$r_ucb.ucb$l_dlck, orig_ipl, SMP_RESTORE);
-
-    /* check the system load again in one second via fork-wait queue */
-    fork_wait (lax_update_stats_fork, NULL, NULL, ucb);
 }

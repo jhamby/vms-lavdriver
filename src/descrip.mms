@@ -5,7 +5,7 @@ debugopts = /DEBUG/NOOPTIMIZE/DEFINE=DEBUG
 .endif
 
 warnopts = /WARN=(ENABLE=(defunct,obsolescent,questcode,unusedtop),-
-	    DISABLE=(boolexprconst,unreachcode,intconcastsgn))
+	    DISABLE=(boolexprconst,unreachcode))
 
 all : laxdriver.exe test-lax-driver.exe test-lav-driver.exe
 	@ write sys$output "Build complete."	! so MMS doesn't complain
