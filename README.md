@@ -1,14 +1,12 @@
 # vms-laxdriver
 [OpenVMS](https://vmssoftware.com/) Load Average eXtended
-device driver (LAX0:), written in C, using IEEE floats.
+device driver (LAX0:), written in C, using fixed-point arithmetic.
 
 This driver is designed after the original LAVDRIVER, provided for reference
 in the `orig-src` directory. The major differences are that it's now much
-smaller, because it's written in C instead of VAX MACRO, it returns the
-values as IEEE floats instead of VAX F_floating values (you can compile the
-test program with different `/FLOAT` values to verify that they match), and
-the system load average computation now gets values from the system instead
-of locking the *SCHED* spinlock and counting them manually.
+smaller, because it's written in C instead of VAX MACRO, and it returns the
+values as 32-bit integers with a 14-bit scaling factor, instead of as
+VAX `F_floating` values.
 
 Another difference from LAVDRIVER is that the load averages are not divided
 by the number of active CPUs, but reflect the total number of processes
