@@ -35,6 +35,7 @@
 #include <pcbdef.h>             /* Process control block */
 #include <prvdef.h>             /* Privilege bits */
 #include <ssdef.h>              /* System service status codes */
+#include <statedef.h>           /* Kernel thread states */
 #include <stsdef.h>             /* Status value fields */
 #include <tqedef.h>             /* Timer queue entry fields */
 #include <ucbdef.h>             /* Unit control block */
@@ -96,6 +97,7 @@ extern KTB* sch$gq_fpgwq;	/* free page wait queue */
 
 extern uint32_t	smp$gl_max_cpuid;   /* max CPU ID for bitmasks */
 extern uint64_t	smp$gq_active_set;  /* active CPU set bitmask */
+extern uint64_t	sch$gq_idle_cpus;   /* idle CPU bitmask */
 
 extern CPU* smp$gl_cpu_data[];  /* CPU data pointer array */
 
@@ -724,18 +726,25 @@ static void lax_stats_update_int (void *fr3, LAX_UCB *ucb, TQE *tqe) {
 
     /* check active CPUs for running processes and their priorities */
     uint32_t lowest_pri = UINT32_MAX;	/* first active CPU will replace this */
-    testmask = 0x01;
 
-    const uint64_t cpu_bitmask = smp$gq_active_set;
+    /* TODO: support >64 CPUs using CBB instead of bitmask */
+    const uint64_t cpu_bitmask = (smp$gq_active_set & ~(sch$gq_idle_cpus));
     const int max_cpuid = (smp$gl_max_cpuid > 63 ? 63 : smp$gl_max_cpuid);
+
+    testmask = 0x01;
     for (int cpuid = 0; cpuid <= max_cpuid; cpuid++, testmask <<= 1) {
 	if (cpu_bitmask & testmask) {
 	    /* assume this is non-NULL; otherwise, something's very wrong */
 	    const CPU *cpu = smp$gl_cpu_data[cpuid];
 
-	    /* priority will be -1 if we're not running a kernel thread */
+	    /* priority will be -1 if we're not running a kernel thread.
+	     * check KTB state to avoid double-counting non-CUR threads.
+	     */
 	    if (cpu->cpu$l_cur_pri != UINT32_MAX) {
-		proc_count++;	/* add active kernel thread to the count */
+		if (cpu->cpu$l_curktb &&
+		    cpu->cpu$l_curktb->ktb$l_state == SCH$C_CUR) {
+		    proc_count++;
+		}
 
 		/* invert internal priority by subtracting from 63 */
 		uint32_t cur_pri = (63 - cpu->cpu$l_cur_pri);
