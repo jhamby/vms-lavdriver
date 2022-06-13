@@ -35,7 +35,6 @@
 #include <pcbdef.h>             /* Process control block */
 #include <prvdef.h>             /* Privilege bits */
 #include <ssdef.h>              /* System service status codes */
-#include <statedef.h>           /* Kernel thread states */
 #include <stsdef.h>             /* Status value fields */
 #include <tqedef.h>             /* Timer queue entry fields */
 #include <ucbdef.h>             /* Unit control block */
@@ -738,13 +737,10 @@ static void lax_stats_update_int (void *fr3, LAX_UCB *ucb, TQE *tqe) {
 	    const CPU *cpu = smp$gl_cpu_data[cpuid];
 
 	    /* priority will be -1 if we're not running a kernel thread.
-	     * check KTB state to avoid double-counting non-CUR threads.
+	     * Skip this CPU if the idle loop is trying to acquire SCHED.
 	     */
-	    if (cpu->cpu$l_cur_pri != UINT32_MAX) {
-		if (cpu->cpu$l_curktb &&
-		    cpu->cpu$l_curktb->ktb$l_state == SCH$C_CUR) {
-		    proc_count++;
-		}
+	    if (cpu->cpu$l_cur_pri != UINT32_MAX && !(cpu->cpu$v_sched)) {
+		proc_count++;
 
 		/* invert internal priority by subtracting from 63 */
 		uint32_t cur_pri = (63 - cpu->cpu$l_cur_pri);
