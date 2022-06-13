@@ -697,32 +697,36 @@ static void lax_stats_update_int (void *fr3, LAX_UCB *ucb, TQE *tqe) {
 
     /* Traverse COM and COMO queues for each priority that's in use. */
 
-    bool has_realtime = (sch$gq_comqs & RT_PRIO_MASK);
-    int startbit = has_realtime ? 0 : FIRST_LIKELY_PRIO;
-    uint64_t testmask = (1ULL << startbit);
+    if (sch$gq_comqs) {
+	bool has_realtime = (sch$gq_comqs & RT_PRIO_MASK);
+	int startbit = has_realtime ? 0 : FIRST_LIKELY_PRIO;
+	uint64_t testmask = (1ULL << startbit);
 
-    for (int idx = startbit; idx < 64; idx++, testmask <<= 1) {
-	if (sch$gq_comqs & testmask) {
-	    KTB* head = sch$aq_comh[idx << 1];
-	    KTB* ktb = head;
-	    while ((ktb = ktb->ktb$l_sqfl) != head) {
-		proc_count++;
+	for (int idx = startbit; idx < 64; idx++, testmask <<= 1) {
+	    if (sch$gq_comqs & testmask) {
+		KTB* head = sch$aq_comh[idx << 1];
+		KTB* ktb = head;
+		while ((ktb = ktb->ktb$l_sqfl) != head) {
+		    proc_count++;
+		}
 	    }
 	}
     }
 
     /* now do the COMO queue */
 
-    has_realtime = (sch$gq_comoqs & RT_PRIO_MASK);
-    startbit = has_realtime ? 0 : FIRST_LIKELY_PRIO;
-    testmask = (1ULL << startbit);
+    if (sch$gq_comoqs) {
+	bool has_realtime = (sch$gq_comoqs & RT_PRIO_MASK);
+	int startbit = has_realtime ? 0 : FIRST_LIKELY_PRIO;
+	uint64_t testmask = (1ULL << startbit);
 
-    for (int idx = startbit; idx < 64; idx++, testmask <<= 1) {
-	if (sch$gq_comoqs & testmask) {
-	    KTB* head = sch$aq_comoh[idx << 1];
-	    KTB* ktb = head;
-	    while ((ktb = ktb->ktb$l_sqfl) != head) {
-		proc_count++;
+	for (int idx = startbit; idx < 64; idx++, testmask <<= 1) {
+	    if (sch$gq_comoqs & testmask) {
+		KTB* head = sch$aq_comoh[idx << 1];
+		KTB* ktb = head;
+		while ((ktb = ktb->ktb$l_sqfl) != head) {
+		    proc_count++;
+		}
 	    }
 	}
     }
@@ -751,7 +755,7 @@ static void lax_stats_update_int (void *fr3, LAX_UCB *ucb, TQE *tqe) {
     const uint64_t cpu_bitmask = (smp$gq_active_set & ~(sch$gq_idle_cpus));
     const int max_cpuid = (smp$gl_max_cpuid > 63 ? 63 : smp$gl_max_cpuid);
 
-    testmask = 0x01;
+    uint64_t testmask = 0x01;
     for (int cpuid = 0; cpuid <= max_cpuid; cpuid++, testmask <<= 1) {
 	if (cpu_bitmask & testmask) {
 	    /* assume this is non-NULL; otherwise, something's very wrong */
