@@ -64,6 +64,16 @@
 #define FX_LSHIFT   (FX_SCALE - 8)	/* coefficients will shift 8 extra bits */
 #define FX_RSHIFT   (FX_SCALE + 10)	/* right-shift after multiply and add */
 
+/* Number of realtime priority levels to test and eliminate (as an optimization).
+ * OpenVMS V7.0 tests bits 0-46 with a mask, skipping to bit 47, corresponding to
+ * external priority 16 (swapper), which is the highest priority typically used,
+ * if none of the bits in the mask are set. Do the same thing in this program.
+ * If you use priorities 17 or higher, reduce this accordingly (subtract from 63).
+ */
+
+#define FIRST_LIKELY_PRIO	47
+#define RT_PRIO_MASK		((1ULL << FIRST_LIKELY_PRIO) - 1)
+
 /* Define Device-Dependent Unit Control Block with extensions for LAX device */
 
 typedef struct {
@@ -687,18 +697,29 @@ static void lax_stats_update_int (void *fr3, LAX_UCB *ucb, TQE *tqe) {
 
     /* Traverse COM and COMO queues for each priority that's in use. */
 
-    uint64_t testmask = 0x01;
-    for (int idx = 0; idx < 128; idx += 2, testmask <<= 1) {
+    bool has_realtime = (sch$gq_comqs & RT_PRIO_MASK);
+    int startbit = has_realtime ? 0 : FIRST_LIKELY_PRIO;
+    uint64_t testmask = (1ULL << startbit);
+
+    for (int idx = startbit; idx < 64; idx++, testmask <<= 1) {
 	if (sch$gq_comqs & testmask) {
-	    KTB* head = sch$aq_comh[idx];
+	    KTB* head = sch$aq_comh[idx << 1];
 	    KTB* ktb = head;
 	    while ((ktb = ktb->ktb$l_sqfl) != head) {
 		proc_count++;
 	    }
 	}
+    }
 
+    /* now do the COMO queue */
+
+    has_realtime = (sch$gq_comoqs & RT_PRIO_MASK);
+    startbit = has_realtime ? 0 : FIRST_LIKELY_PRIO;
+    testmask = (1ULL << startbit);
+
+    for (int idx = startbit; idx < 64; idx++, testmask <<= 1) {
 	if (sch$gq_comoqs & testmask) {
-	    KTB* head = sch$aq_comoh[idx];
+	    KTB* head = sch$aq_comoh[idx << 1];
 	    KTB* ktb = head;
 	    while ((ktb = ktb->ktb$l_sqfl) != head) {
 		proc_count++;
